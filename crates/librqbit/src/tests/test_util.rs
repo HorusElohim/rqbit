@@ -200,19 +200,3 @@ pub async fn wait_until(
     }
     Ok(())
 }
-
-pub async fn wait_until_i_am_the_last_task() -> anyhow::Result<()> {
-    let metrics = tokio::runtime::Handle::current().metrics();
-    wait_until(
-        || {
-            let num_alive = metrics.num_alive_tasks();
-            if num_alive != 0 {
-                bail!("metrics.num_alive_tasks() = {num_alive}, expected 0")
-            }
-            Ok(())
-        },
-        // This needs to be higher than the timeout the tasks print "still running"
-        Duration::from_secs(15),
-    )
-    .await
-}

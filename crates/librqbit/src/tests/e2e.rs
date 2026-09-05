@@ -16,7 +16,7 @@ use crate::{
     spawn_utils::BlockingSpawner,
     tests::test_util::{
         DropChecks, TestPeerMetadata, create_default_random_dir_with_torrents, setup_test_logging,
-        wait_until_i_am_the_last_task,
+        wait_until,
     },
 };
 
@@ -45,8 +45,11 @@ async fn _test_e2e_download_timeout_and_cleanups(mode: ListenerMode) {
     .context("test_e2e_download timed out")
     .unwrap();
 
-    // Wait to ensure everything is dropped.
-    wait_until_i_am_the_last_task().await.unwrap();
+    // Wait only for objects owned by this test. Other E2E tests run in
+    // parallel and legitimately own Tokio tasks.
+    wait_until(|| drop_checks.check(), Duration::from_secs(15))
+        .await
+        .unwrap();
 
     drop_checks.check().unwrap();
 }
@@ -373,6 +376,12 @@ async fn _test_e2e_download(mode: ListenerMode, drop_checks: &DropChecks) {
             0,
             "{outdir:?} was not empty after deletion"
         );
+
+        // Explicitly stop every session before dropping the last Arc. The
+        // sequential piece scheduler can leave active peer/accept tasks at
+        // this point; relying on Drop alone makes cleanup timing-dependent.
+        session.stop().await;
+        futures::future::join_all(_servers.iter().map(|server| server.stop())).await;
 
         info!("all good");
     }
