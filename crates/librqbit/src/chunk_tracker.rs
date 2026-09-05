@@ -237,15 +237,24 @@ impl ChunkTracker {
         &'a self,
         file_priorities: &'a FilePriorities,
         file_infos: &'a FileInfos,
-    ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
-        file_priorities
+    ) -> Box<dyn Iterator<Item = ValidPieceIndex> + 'a> {
+        // Portalis is a media library: finish the first unfinished selected
+        // file before exposing later files to the general picker. Streaming
+        // requests still arrive through `priority_pieces` and take precedence.
+        let Some((_, file)) = file_priorities
             .iter()
-            .filter_map(|p| Some((*p, file_infos.get(*p)?)))
-            .filter(|(id, f)| self.per_file_bytes[*id] != f.len)
-            .flat_map(|(_id, f)| f.iter_piece_priorities())
-            .filter(|id| self.queue_pieces[*id])
-            .filter_map(|id| id.try_into().ok())
-            .filter_map(|id| self.lengths.validate_piece_index(id))
+            .filter_map(|id| Some((*id, file_infos.get(*id)?)))
+            .find(|(id, file)| self.per_file_bytes[*id] != file.len)
+        else {
+            return Box::new(std::iter::empty());
+        };
+
+        Box::new(
+            file.iter_piece_priorities()
+                .filter(|id| self.queue_pieces[*id])
+                .filter_map(|id| id.try_into().ok())
+                .filter_map(|id| self.lengths.validate_piece_index(id)),
+        )
     }
 
     pub(crate) fn is_piece_have(&self, id: ValidPieceIndex) -> bool {
@@ -510,6 +519,69 @@ mod tests {
                 assert!(!chunks[4]);
             }
         }
+    }
+
+    #[test]
+    fn queued_pieces_finish_one_file_before_starting_the_next() {
+        let piece_len = CHUNK_SIZE;
+        let lengths = Lengths::new((piece_len * 4) as u64, piece_len).unwrap();
+        let file_infos = vec![
+            FileInfo {
+                relative_filename: "first.jpg".into(),
+                offset_in_torrent: 0,
+                piece_range: 0..2,
+                attrs: Default::default(),
+                len: (piece_len * 2) as u64,
+            },
+            FileInfo {
+                relative_filename: "second.jpg".into(),
+                offset_in_torrent: (piece_len * 2) as u64,
+                piece_range: 2..4,
+                attrs: Default::default(),
+                len: (piece_len * 2) as u64,
+            },
+        ];
+        let selected = {
+            let mut bits =
+                BF::from_boxed_slice(vec![0u8; lengths.piece_bitfield_bytes()].into_boxed_slice());
+            bits.fill(true);
+            bits
+        };
+        let no_have =
+            BF::from_boxed_slice(vec![0u8; lengths.piece_bitfield_bytes()].into_boxed_slice());
+        let tracker = ChunkTracker::new(no_have.into_dyn(), selected, lengths, &file_infos)
+            .expect("valid file layout");
+
+        let priorities = vec![0, 1];
+        let queued: Vec<_> = tracker
+            .iter_queued_pieces(&priorities, &file_infos)
+            .map(|piece| piece.get())
+            .collect();
+        assert_eq!(queued, vec![0, 1]);
+
+        let mut first_have =
+            BF::from_boxed_slice(vec![0u8; lengths.piece_bitfield_bytes()].into_boxed_slice());
+        first_have.set(0, true);
+        first_have.set(1, true);
+        let tracker = ChunkTracker::new(
+            first_have.into_dyn(),
+            {
+                let mut bits = BF::from_boxed_slice(
+                    vec![0u8; lengths.piece_bitfield_bytes()].into_boxed_slice(),
+                );
+                bits.fill(true);
+                bits
+            },
+            lengths,
+            &file_infos,
+        )
+        .expect("valid completed first file");
+        let priorities = vec![0, 1];
+        let queued: Vec<_> = tracker
+            .iter_queued_pieces(&priorities, &file_infos)
+            .map(|piece| piece.get())
+            .collect();
+        assert_eq!(queued, vec![2, 3]);
     }
 
     #[test]
