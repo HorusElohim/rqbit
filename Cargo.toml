@@ -156,3 +156,8 @@ urlencoding = "2"
 uuid = "1"
 walkdir = "2"
 windows = "0.62"
+
+[patch.crates-io]
+# iOS must use Darwin's index-based socket binding; the published 0.7.0
+# crate incorrectly selects socket2::bind_device on iOS.
+librqbit-dualstack-sockets = { git = "https://github.com/HorusElohim/librqbit-dualstack-sockets", rev = "9d142bc" }
