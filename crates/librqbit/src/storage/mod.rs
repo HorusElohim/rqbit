@@ -69,6 +69,10 @@ pub trait StorageFactory: Send + Sync + Any {
     fn is_type_id(&self, type_id: TypeId) -> bool {
         Self::type_id(self) == type_id
     }
+    /// Whether the session persistence backend can reconstruct this factory.
+    fn supports_persistence(&self) -> bool {
+        true
+    }
     fn clone_box(&self) -> BoxStorageFactory;
 }
 
@@ -100,6 +104,10 @@ impl<SF: StorageFactory> StorageFactoryExt for SF {
                 self.sf.is_type_id(type_id)
             }
 
+            fn supports_persistence(&self) -> bool {
+                self.sf.supports_persistence()
+            }
+
             fn clone_box(&self) -> BoxStorageFactory {
                 self.sf.clone_box()
             }
@@ -126,6 +134,10 @@ impl<U: StorageFactory + ?Sized> StorageFactory for Box<U> {
 
     fn clone_box(&self) -> BoxStorageFactory {
         (**self).clone_box()
+    }
+
+    fn supports_persistence(&self) -> bool {
+        (**self).supports_persistence()
     }
 }
 
