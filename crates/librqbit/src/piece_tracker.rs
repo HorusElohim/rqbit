@@ -273,6 +273,14 @@ impl PieceTracker {
         self.inflight.contains_key(&piece)
     }
 
+    /// Every piece currently in flight, with the peer downloading it.
+    ///
+    /// Portalis addition: the transfer detail view needs to show which
+    /// pieces are actively being fetched and from where.
+    pub fn inflight_pieces(&self) -> impl Iterator<Item = (ValidPieceIndex, &InflightPiece)> {
+        self.inflight.iter().map(|(piece, info)| (*piece, info))
+    }
+
     /// Get the number of pieces currently in-flight.
     #[allow(dead_code)]
     pub fn inflight_count(&self) -> usize {
