@@ -114,6 +114,7 @@ use self::{
 use super::{
     ManagedTorrentShared, TorrentMetadata,
     paused::TorrentStatePaused,
+    stats::{InflightPieceStats, PieceActivityStats},
     streaming::TorrentStreams,
     utils::{TimedExistence, timeit},
 };
@@ -217,6 +218,33 @@ pub struct TorrentStateLive {
 }
 
 impl TorrentStateLive {
+    pub(crate) fn piece_activity_snapshot(&self) -> PieceActivityStats {
+        let g = self.lock_read("piece_activity");
+        let verified_piece_bitmap = g
+            .get_chunks()
+            .map(|chunks| chunks.get_have_pieces().as_bytes().to_vec())
+            .unwrap_or_default();
+        let mut inflight_pieces = g
+            .get_pieces()
+            .map(|pieces| {
+                pieces
+                    .inflight_pieces()
+                    .map(|(piece, assignment)| InflightPieceStats {
+                        piece_index: piece.get(),
+                        peer: assignment.peer.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        inflight_pieces.sort_unstable_by_key(|assignment| assignment.piece_index);
+        PieceActivityStats {
+            piece_length: self.lengths.default_piece_length(),
+            piece_count: self.lengths.total_pieces(),
+            verified_piece_bitmap,
+            inflight_pieces,
+        }
+    }
+
     pub(crate) fn new(
         paused: TorrentStatePaused,
         fatal_errors_tx: tokio::sync::oneshot::Sender<anyhow::Error>,
