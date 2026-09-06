@@ -11,9 +11,18 @@ pub struct FileInfo {
     pub len: u64,
 }
 
-// Iterate file pieces sequentially from start to end.
+// Iterate file pieces in the following order: first, last, everything else from start to end.
 fn iter_piece_priorities(range: std::ops::Range<usize>) -> impl Iterator<Item = usize> {
-    range
+    // First and last of each file first, then the rest of pieces in that file.
+    let r = range;
+    use std::iter::once;
+
+    let first = once(r.start);
+    let last = once(r.start + r.len().overflowing_sub(1).0); // it's ok if it repeats, doesn't matter
+    let mid = r.clone().skip(1).take(r.len().overflowing_sub(2).0);
+
+    // The take(r.len()) is to not yield start/end pieces in case of 0 and 1 lengths.
+    first.chain(last).chain(mid).take(r.len())
 }
 
 impl FileInfo {
@@ -37,7 +46,7 @@ mod tests {
 
         assert_eq!(it(0..1), vec![0]);
         assert_eq!(it(0..2), vec![0, 1]);
-        assert_eq!(it(0..3), vec![0, 1, 2]);
-        assert_eq!(it(0..4), vec![0, 1, 2, 3]);
+        assert_eq!(it(0..3), vec![0, 2, 1]);
+        assert_eq!(it(0..4), vec![0, 3, 1, 2]);
     }
 }
