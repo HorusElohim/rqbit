@@ -276,8 +276,7 @@ impl PieceTracker {
     /// Every piece currently in flight, with the peer downloading it.
     ///
     /// Portalis addition: the transfer detail view needs to show which
-    /// pieces are actively being fetched and from where, which single-piece
-    /// lookups above cannot answer without knowing every candidate index.
+    /// pieces are actively being fetched and from where.
     pub fn inflight_pieces(&self) -> impl Iterator<Item = (ValidPieceIndex, &InflightPiece)> {
         self.inflight.iter().map(|(piece, info)| (*piece, info))
     }
@@ -750,7 +749,7 @@ mod tests {
         let peer_a = peer(1);
         let peer_b = peer(2);
 
-        // Peer A reserves pieces 0 and 1 (first two in sequential order)
+        // Peer A reserves pieces 0 and 4 (first two in iteration order)
         let piece_0 = match tracker.acquire_piece(AcquireRequest {
             peer: peer_a,
             peer_avg_time: None,
@@ -767,7 +766,7 @@ mod tests {
             _ => panic!("Expected Reserved"),
         };
 
-        let piece_1 = match tracker.acquire_piece(AcquireRequest {
+        let piece_4 = match tracker.acquire_piece(AcquireRequest {
             peer: peer_a,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
@@ -777,7 +776,7 @@ mod tests {
             can_steal: |_| true,
         }) {
             AcquireResult::Reserved(p) => {
-                assert_eq!(p.get(), 1);
+                assert_eq!(p.get(), 4);
                 p
             }
             _ => panic!("Expected Reserved"),
@@ -788,21 +787,21 @@ mod tests {
 
         // Peer B tries to acquire with:
         // - Very short avg_time (1ms) so 3x threshold = 3ms < 5ms elapsed
-        // - peer_has_piece returns true ONLY for piece 1, NOT piece 0
+        // - peer_has_piece returns true ONLY for piece 4, NOT piece 0
         let result = tracker.acquire_piece(AcquireRequest {
             peer: peer_b,
             peer_avg_time: Some(Duration::from_millis(1)),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
-            peer_has_piece: |p| p.get() == 1, // Peer B only has piece 1
+            peer_has_piece: |p| p.get() == 4, // Peer B only has piece 4
             can_steal: |_| true,
         });
 
-        // Should steal piece 1 (which peer B has), NOT piece 0 (which peer B doesn't have)
+        // Should steal piece 4 (which peer B has), NOT piece 0 (which peer B doesn't have)
         match result {
             AcquireResult::Stolen { piece, from_peer } => {
-                assert_eq!(piece, piece_1, "Should steal piece 1 (the one peer B has)");
+                assert_eq!(piece, piece_4, "Should steal piece 4 (the one peer B has)");
                 assert_eq!(from_peer, peer_a);
                 // Verify piece 0 is still owned by peer A (wasn't stolen)
                 assert_eq!(tracker.get_inflight(piece_0).unwrap().peer, peer_a);
