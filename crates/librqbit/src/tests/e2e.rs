@@ -375,5 +375,8 @@ async fn _test_e2e_download(mode: ListenerMode, drop_checks: &DropChecks) {
         );
 
         info!("all good");
+        session.stop().await;
     }
+
+    futures::future::join_all(_servers.iter().map(|server| server.stop())).await;
 }
