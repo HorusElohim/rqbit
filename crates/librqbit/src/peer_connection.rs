@@ -55,6 +55,9 @@ pub trait PeerConnectionHandler {
     fn client_name_and_version(&self) -> &str {
         crate::client_name_and_version()
     }
+    fn requires_client_name_marker(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -294,6 +297,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         let extended_handshake: RwLock<Option<PeerExtendedMessageIds>> = RwLock::new(None);
         let extended_handshake_ref = &extended_handshake;
         let supports_extended = handshake_supports_extended;
+
+        if self.handler.requires_client_name_marker() && !supports_extended {
+            return Err(Error::Anyhow(anyhow::anyhow!(
+                "peer does not support the extended handshake required by this torrent"
+            )));
+        }
 
         if supports_extended {
             let mut my_extended = ExtendedHandshake::new();

@@ -1133,6 +1133,14 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         Ok(())
     }
 
+    fn requires_client_name_marker(&self) -> bool {
+        self.state
+            .shared
+            .options
+            .required_client_name_marker
+            .is_some()
+    }
+
     fn on_uploaded_bytes(&self, bytes: u32) {
         self.counters
             .uploaded_bytes
@@ -1153,7 +1161,18 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn on_extended_handshake(&self, hs: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
-        if let Some(client_name) = hs.v.as_ref().and_then(format_peer_client_name) {
+        let client_name = hs.v.as_ref().and_then(format_peer_client_name);
+        if !has_required_client_name(
+            client_name.as_deref(),
+            self.state
+                .shared
+                .options
+                .required_client_name_marker
+                .as_deref(),
+        ) {
+            bail!("peer client name does not satisfy this torrent's admission policy");
+        }
+        if let Some(client_name) = client_name {
             self.state
                 .peers
                 .with_live_mut(self.addr, "update peer client name", |live| {
@@ -2091,4 +2110,38 @@ fn format_peer_client_name(value: &ByteBuf<'_>) -> Option<String> {
     }
 
     Some(client_name)
+}
+
+fn has_required_client_name(client_name: Option<&str>, marker: Option<&str>) -> bool {
+    marker.map_or(true, |marker| {
+        client_name.is_some_and(|client_name| client_name.contains(marker))
+    })
+}
+
+#[cfg(test)]
+mod client_name_policy_tests {
+    use super::has_required_client_name;
+
+    #[test]
+    fn no_policy_accepts_every_peer() {
+        assert!(has_required_client_name(None, None));
+        assert!(has_required_client_name(Some("qBittorrent/5.2.3"), None));
+    }
+
+    #[test]
+    fn portalis_policy_accepts_a_portalis_client() {
+        assert!(has_required_client_name(
+            Some("Alice Portalis 0.1.77"),
+            Some("Portalis"),
+        ));
+    }
+
+    #[test]
+    fn portalis_policy_rejects_non_portalis_or_missing_client_names() {
+        assert!(!has_required_client_name(
+            Some("qBittorrent/5.2.3"),
+            Some("Portalis"),
+        ));
+        assert!(!has_required_client_name(None, Some("Portalis")));
+    }
 }
