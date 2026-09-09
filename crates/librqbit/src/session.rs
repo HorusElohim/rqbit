@@ -280,6 +280,12 @@ pub struct AddTorrentOptions {
     /// Initial peers to start of with.
     pub initial_peers: Option<Vec<SocketAddr>>,
 
+    /// Require a marker in the remote client's extended-handshake name before
+    /// allowing this torrent to exchange data. `None` leaves ordinary
+    /// BitTorrent behavior unchanged.
+    #[serde(default)]
+    pub required_client_name_marker: Option<String>,
+
     /// Max concurrent connected peers.
     pub peer_limit: Option<usize>,
 
@@ -1359,6 +1365,7 @@ impl Session {
                     output_folder,
                     ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
+                    required_client_name_marker: opts.required_client_name_marker.clone(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,

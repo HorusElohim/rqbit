@@ -55,6 +55,9 @@ pub trait PeerConnectionHandler {
     fn client_name_and_version(&self) -> &str {
         crate::client_name_and_version()
     }
+    fn requires_client_name_marker(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -170,8 +173,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         );
 
         let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
-        let handshake = Handshake::new(self.info_hash, self.peer_id);
-        let hlen = handshake.serialize_unchecked_len(&mut *write_buf);
+        let my_handshake = Handshake::new(self.info_hash, self.peer_id);
+        let hlen = my_handshake.serialize_unchecked_len(&mut *write_buf);
         with_timeout(
             "writing handshake",
             rwtimeout,
@@ -182,10 +185,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         )
         .await?;
 
-        let handshake_supports_extended = handshake.supports_extended();
+        // What the peer supports is in the peer's handshake, not in ours.
+        let handshake_supports_extended = incoming.handshake.supports_extended();
 
         self.handler
-            .on_handshake(handshake, incoming.kind)
+            .on_handshake(incoming.handshake, incoming.kind)
             .map_err(Error::Anyhow)?;
 
         self.manage_peer(ManagePeerArgs {
@@ -293,6 +297,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         let extended_handshake: RwLock<Option<PeerExtendedMessageIds>> = RwLock::new(None);
         let extended_handshake_ref = &extended_handshake;
         let supports_extended = handshake_supports_extended;
+
+        if self.handler.requires_client_name_marker() && !supports_extended {
+            return Err(Error::Anyhow(anyhow::anyhow!(
+                "peer does not support the extended handshake required by this torrent"
+            )));
+        }
 
         if supports_extended {
             let mut my_extended = ExtendedHandshake::new();
