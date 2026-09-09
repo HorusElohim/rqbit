@@ -105,10 +105,6 @@ impl<SF: StorageFactory> StorageFactoryExt for SF {
                 self.sf.supports_persistence()
             }
 
-            fn supports_persistence(&self) -> bool {
-                self.sf.supports_persistence()
-            }
-
             fn clone_box(&self) -> BoxStorageFactory {
                 self.sf.clone_box()
             }
