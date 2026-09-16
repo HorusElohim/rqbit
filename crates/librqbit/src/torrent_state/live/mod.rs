@@ -747,7 +747,13 @@ impl TorrentStateLive {
         let _ = self.have_broadcast_tx.send(index);
     }
 
-    pub(crate) fn add_peer_if_not_seen(&self, addr: SocketAddr) -> crate::Result<bool> {
+    /// Queues a peer address for connection if it has not already been seen
+    /// on this torrent. `pub` (not `pub(crate)`): downstream apps embedding
+    /// this crate need to top up a live torrent's peer set after it is
+    /// already loaded — e.g. re-scanning a QR whose endpoint changed since
+    /// the torrent was first added — without tearing the handle down and
+    /// re-adding it.
+    pub fn add_peer_if_not_seen(&self, addr: SocketAddr) -> crate::Result<bool> {
         match self.peers.add_if_not_seen(addr) {
             Some(handle) => handle,
             None => return Ok(false),
