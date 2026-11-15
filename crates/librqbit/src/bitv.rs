@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use bitvec::{boxed::BitBox, order::Msb0, slice::BitSlice, vec::BitVec};
+use parking_lot::Mutex;
 use tracing::debug_span;
 
 use crate::{spawn_utils::BlockingSpawner, storage::filesystem::OurFileExt};
@@ -17,24 +18,42 @@ pub trait BitV: Send + Sync {
 pub type BoxBitV = Box<dyn BitV>;
 
 struct DiskFlushRequest {
+    generation: u64,
     snapshot: BitBox<u8, Msb0>,
+}
+
+struct DiskBitVWriter {
+    file: std::fs::File,
+    flushed_generation: u64,
+}
+
+impl DiskBitVWriter {
+    fn persist(&mut self, request: &DiskFlushRequest) -> anyhow::Result<()> {
+        // A queued asynchronous snapshot must never roll back a newer
+        // synchronous completion checkpoint.
+        if request.generation <= self.flushed_generation {
+            return Ok(());
+        }
+        self.file
+            .pwrite_all(0, request.snapshot.as_raw_slice())
+            .context("writing piece checkpoint")?;
+        self.file.sync_all().context("syncing piece checkpoint")?;
+        self.flushed_generation = request.generation;
+        Ok(())
+    }
 }
 
 pub struct DiskBackedBitV {
     bv: BitBox<u8, Msb0>,
     flush_tx: tokio::sync::mpsc::UnboundedSender<DiskFlushRequest>,
+    writer: Arc<Mutex<DiskBitVWriter>>,
+    generation: u64,
 }
 
 impl Drop for DiskBackedBitV {
     fn drop(&mut self) {
-        if self
-            .flush_tx
-            .send(DiskFlushRequest {
-                snapshot: self.bv.clone(),
-            })
-            .is_err()
-        {
-            tracing::warn!("error flushing bitv on drop: flusher task is dead")
+        if let Err(error) = self.flush(true) {
+            tracing::warn!("error flushing bitv on drop: {error:#}");
         }
     }
 }
@@ -61,6 +80,11 @@ impl DiskBackedBitV {
             .await
             .with_context(|| format!("error opening {filename:?}"))?;
 
+        let writer = Arc::new(Mutex::new(DiskBitVWriter {
+            file,
+            flushed_generation: 0,
+        }));
+        let background_writer = writer.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DiskFlushRequest>();
         librqbit_core::spawn_utils::spawn(
             debug_span!("diskbitv-flusher", ?filename),
@@ -75,9 +99,7 @@ impl DiskBackedBitV {
                     }
 
                     if let Err(e) = spawner
-                        .block_in_place_with_semaphore(|| {
-                            file.pwrite_all(0, req.snapshot.as_raw_slice())
-                        })
+                        .block_in_place_with_semaphore(|| background_writer.lock().persist(&req))
                         .await
                     {
                         tracing::error!(?filename, "error writing to bitv: {e:#}");
@@ -86,19 +108,17 @@ impl DiskBackedBitV {
                         }
                         break;
                     }
-
-                    if let Err(e) = spawner
-                        .block_in_place_with_semaphore(|| file.sync_all())
-                        .await
-                    {
-                        tracing::error!(?filename, "error fsyncing bitv: {e:#}");
-                    }
                 }
 
                 Ok::<_, anyhow::Error>(())
             },
         );
-        Ok(Self { bv, flush_tx: tx })
+        Ok(Self {
+            bv,
+            flush_tx: tx,
+            writer,
+            generation: 0,
+        })
     }
 }
 
@@ -138,11 +158,21 @@ impl BitV for DiskBackedBitV {
         self.bv.as_raw_slice()
     }
 
-    fn flush(&mut self, _flush_async: bool) -> anyhow::Result<()> {
+    fn flush(&mut self, flush_async: bool) -> anyhow::Result<()> {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .context("piece checkpoint generation exhausted")?;
         let req = DiskFlushRequest {
+            generation: self.generation,
             snapshot: self.bv.clone(),
         };
-        self.flush_tx.send(req).context("flusher task is dead")
+        if flush_async {
+            return self.flush_tx.send(req).context("flusher task is dead");
+        }
+        // Completion must acknowledge persistence, including fsync. Do not
+        // wait for the async task: that deadlocks a single-threaded runtime.
+        self.writer.lock().persist(&req)
     }
 
     fn into_dyn(self) -> Box<dyn BitV> {
@@ -169,5 +199,43 @@ impl BitV for Box<dyn BitV> {
 
     fn into_dyn(self) -> Box<dyn BitV> {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(generation: u64, byte: u8) -> DiskFlushRequest {
+        DiskFlushRequest {
+            generation,
+            snapshot: BitVec::from_vec(vec![byte]).into_boxed_bitslice(),
+        }
+    }
+
+    #[test]
+    fn queued_old_snapshots_cannot_replace_a_newer_completion_checkpoint() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = DiskBitVWriter {
+            file: file.reopen().unwrap(),
+            flushed_generation: 0,
+        };
+        writer.persist(&request(2, 0xc0)).unwrap();
+        writer.persist(&request(1, 0x80)).unwrap();
+        assert_eq!(std::fs::read(file.path()).unwrap(), [0xc0]);
+        assert_eq!(writer.flushed_generation, 2);
+    }
+
+    #[test]
+    fn failed_checkpoint_writes_do_not_acknowledge_the_generation() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), [0_u8]).unwrap();
+        let mut writer = DiskBitVWriter {
+            file: std::fs::File::open(file.path()).unwrap(),
+            flushed_generation: 0,
+        };
+        assert!(writer.persist(&request(1, 0x80)).is_err());
+        assert_eq!(writer.flushed_generation, 0);
+        assert_eq!(std::fs::read(file.path()).unwrap(), [0]);
     }
 }
