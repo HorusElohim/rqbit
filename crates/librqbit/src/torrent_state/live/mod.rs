@@ -893,16 +893,19 @@ impl TorrentStateLive {
             .wake_streams_on_piece_completed(id, self.metadata.lengths());
 
         locked.unflushed_bitv_bytes += self.metadata.lengths().piece_length(id) as u64;
-        if locked.unflushed_bitv_bytes >= FLUSH_BITV_EVERY_BYTES {
-            locked.try_flush_bitv(&self.shared, true)
+        let chunks = locked.get_chunks()?;
+        let finished = chunks.is_finished();
+        let completed_selected_piece = finished && chunks.get_selected_pieces()[id.get_usize()];
+        // Completion takes priority even when this piece also reaches the
+        // periodic threshold: an async flush must not consume its barrier.
+        if completed_selected_piece {
+            locked.try_flush_bitv(&self.shared, false);
+            info!(id=self.shared.id, info_hash=?self.shared.info_hash, "torrent finished downloading");
+        } else if locked.unflushed_bitv_bytes >= FLUSH_BITV_EVERY_BYTES {
+            locked.try_flush_bitv(&self.shared, true);
         }
 
-        let chunks = locked.get_chunks()?;
-        if chunks.is_finished() {
-            if chunks.get_selected_pieces()[id.get_usize()] {
-                locked.try_flush_bitv(&self.shared, false);
-                info!(id=self.shared.id, info_hash=?self.shared.info_hash, "torrent finished downloading");
-            }
+        if finished {
             self.finished_notify.notify_waiters();
 
             if !self.has_active_streams_unfinished_files(locked) {
@@ -2150,6 +2153,110 @@ fn has_required_client_name(client_name: Option<&str>, marker: Option<&str>) -> 
     marker.map_or(true, |marker| {
         client_name.is_some_and(|client_name| client_name.contains(marker))
     })
+}
+
+#[cfg(test)]
+mod completion_checkpoint_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn final_piece_at_periodic_flush_boundary_is_checkpointed_synchronously() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.bin");
+        const PIECE_LENGTH: u32 = 2 * 1024 * 1024;
+        std::fs::write(&source, vec![0x53; FLUSH_BITV_EVERY_BYTES as usize]).unwrap();
+        let metainfo = crate::create_torrent(
+            &source,
+            crate::CreateTorrentOptions {
+                piece_length: Some(PIECE_LENGTH),
+                ..Default::default()
+            },
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        let session = crate::Session::new_with_opts(
+            root.path().join("downloads"),
+            crate::SessionOptions {
+                dht: None,
+                fastresume: true,
+                persistence: Some(crate::SessionPersistenceConfig::Json {
+                    folder: Some(root.path().join("persistence")),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let handle = session
+            .add_torrent(
+                crate::AddTorrent::from_bytes(metainfo.as_bytes().unwrap()),
+                Some(crate::AddTorrentOptions {
+                    output_folder: Some(root.path().to_string_lossy().into_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+        let live = handle
+            .with_state(|state| match state {
+                crate::ManagedTorrentState::Live(live) => Ok(live.clone()),
+                _ => anyhow::bail!("expected a live torrent"),
+            })
+            .unwrap();
+        let lengths = live.metadata.lengths();
+        let last_piece = lengths
+            .validate_piece_index(lengths.total_pieces() - 1)
+            .unwrap();
+        let empty = crate::type_aliases::BF::from_boxed_slice(vec![0_u8].into_boxed_slice());
+        let mut bitmap = session
+            .bitv_factory()
+            .store_initial_check(handle.info_hash().into(), empty)
+            .await
+            .unwrap();
+        for index in 0..last_piece.get_usize() {
+            bitmap.as_slice_mut().set(index, true);
+        }
+        let selected = crate::chunk_tracker::compute_selected_pieces(
+            lengths,
+            |_| true,
+            &live.metadata.file_infos,
+        );
+        let chunks = crate::chunk_tracker::ChunkTracker::new(
+            bitmap,
+            selected,
+            *lengths,
+            &live.metadata.file_infos,
+        )
+        .unwrap();
+        {
+            // Recreate the real seam between successful final-piece hashing
+            // and completion handling, with seven pieces not yet checkpointed.
+            let mut locked = live.lock_write("checkpoint test");
+            let mut pieces = crate::piece_tracker::PieceTracker::new(chunks);
+            pieces.mark_piece_hash_ok(last_piece);
+            locked.pieces = Some(pieces);
+            locked.unflushed_bitv_bytes = FLUSH_BITV_EVERY_BYTES - u64::from(PIECE_LENGTH);
+        }
+        live.on_piece_completed(last_piece).unwrap();
+        // No yield: an enqueued flush cannot satisfy this completion barrier.
+        let saved = std::fs::read(
+            root.path()
+                .join("persistence")
+                .join(format!("{}.bitv", handle.info_hash().as_string())),
+        )
+        .unwrap();
+        session.stop().await;
+        assert_eq!(
+            saved,
+            [0xff],
+            "final completion must not be downgraded to a periodic asynchronous flush"
+        );
+    }
 }
 
 #[cfg(test)]

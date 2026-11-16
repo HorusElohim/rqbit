@@ -154,7 +154,7 @@ impl TorrentStateInitializing {
                     })
                     .enumerate()
                 {
-                    if fo.check_piece(piece_id).is_err() {
+                    if !matches!(fo.check_piece(piece_id), Ok(true)) {
                         return true;
                     }
 
@@ -176,7 +176,7 @@ impl TorrentStateInitializing {
                 info_hash = ?self.shared.info_hash,
                 "data corrupted, ignoring fastresume data"
             );
-            if let Err(e) = bitv_factory.clear(self.shared.id.into()).await {
+            if let Err(e) = bitv_factory.clear(self.shared.info_hash.into()).await {
                 warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, "error clearing bitfield: {e:#}");
             }
             self.checked_bytes.store(0, Ordering::Relaxed);
@@ -184,6 +184,53 @@ impl TorrentStateInitializing {
         }
 
         Some(hp)
+    }
+
+    /// A saved bitmap can lag behind payload writes if the process died
+    /// before checkpointing. Recover only selected pieces whose bytes really
+    /// match; never reinterpret an unset bit as proof that data is absent.
+    async fn recover_uncheckpointed_pieces(
+        &self,
+        bitv_factory: &dyn BitVFactory,
+        mut have_pieces: Box<dyn BitV>,
+        selected_pieces: &BF,
+    ) -> anyhow::Result<Box<dyn BitV>> {
+        let recovered = self
+            .shared
+            .spawner
+            .block_in_place_with_semaphore(|| {
+                let files =
+                    FileOps::new(&self.metadata.info, &self.files, &self.metadata.file_infos);
+                let mut recovered = 0usize;
+                for index in selected_pieces.iter_ones() {
+                    if have_pieces.as_slice()[index] {
+                        continue;
+                    }
+                    anyhow::ensure!(!self.is_pause_requested(), "initial check paused");
+                    let piece = self
+                        .metadata
+                        .lengths()
+                        .validate_piece_index(index.try_into()?)
+                        .context("selected piece index is invalid")?;
+                    if matches!(files.check_piece(piece), Ok(true)) {
+                        have_pieces.as_slice_mut().set(index, true);
+                        recovered += 1;
+                    }
+                }
+                Ok::<_, anyhow::Error>(recovered)
+            })
+            .await?;
+        if recovered == 0 {
+            return Ok(have_pieces);
+        }
+        info!(id=?self.shared.id, recovered, "recovered verified pieces missing from the checkpoint");
+        bitv_factory
+            .store_initial_check(
+                self.shared.info_hash.into(),
+                have_pieces.as_slice().to_owned().into_boxed_bitslice(),
+            )
+            .await
+            .context("storing recovered piece checkpoint")
     }
 
     pub async fn check(&self) -> anyhow::Result<TorrentStatePaused> {
@@ -209,8 +256,21 @@ impl TorrentStateInitializing {
 
         let have_pieces = self.validate_fastresume(&*bitv_factory, have_pieces).await;
 
+        let selected_pieces = compute_selected_pieces(
+            self.metadata.lengths(),
+            |idx| {
+                self.only_files
+                    .as_ref()
+                    .map(|o| o.contains(&idx))
+                    .unwrap_or(true)
+            },
+            &self.metadata.file_infos,
+        );
         let have_pieces = match have_pieces {
-            Some(h) => h,
+            Some(h) => {
+                self.recover_uncheckpointed_pieces(&*bitv_factory, h, &selected_pieces)
+                    .await?
+            }
             None => {
                 info!("Doing initial checksum validation, this might take a while...");
                 let have_pieces = self
@@ -227,17 +287,6 @@ impl TorrentStateInitializing {
                     .context("error storing initial check bitfield")?
             }
         };
-
-        let selected_pieces = compute_selected_pieces(
-            self.metadata.lengths(),
-            |idx| {
-                self.only_files
-                    .as_ref()
-                    .map(|o| o.contains(&idx))
-                    .unwrap_or(true)
-            },
-            &self.metadata.file_infos,
-        );
 
         let chunk_tracker = ChunkTracker::new(
             have_pieces.into_dyn(),
