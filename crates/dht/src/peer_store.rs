@@ -1,7 +1,6 @@
 use std::{collections::VecDeque, net::SocketAddr, str::FromStr, sync::atomic::AtomicU32};
 
 use bencode::ByteBufOwned;
-use chrono::{DateTime, Utc};
 use librqbit_core::{compact_ip::CompactSocketAddr, hash_id::Id20};
 use parking_lot::RwLock;
 use rand::Rng;
@@ -9,6 +8,7 @@ use serde::{
     Deserialize, Serialize,
     ser::{SerializeMap, SerializeStruct},
 };
+use time::OffsetDateTime;
 use tracing::trace;
 
 use crate::bprotocol::{AnnouncePeer, Want};
@@ -24,7 +24,9 @@ struct StoredToken {
 #[derive(Serialize, Deserialize)]
 struct StoredPeer {
     addr: SocketAddr,
-    time: DateTime<Utc>,
+    // RFC 3339 keeps dht.json files written by the former chrono timestamp readable.
+    #[serde(with = "time::serde::rfc3339")]
+    time: OffsetDateTime,
 }
 
 pub struct PeerStore {
@@ -155,7 +157,7 @@ impl PeerStore {
         match peers_entry {
             Entry::Occupied(mut occ) => {
                 if let Some(s) = occ.get_mut().iter_mut().find(|s| s.addr == addr) {
-                    s.time = Utc::now();
+                    s.time = OffsetDateTime::now_utc();
                     return true;
                 }
                 if peers_len >= self.max_remembered_peers {
@@ -164,7 +166,7 @@ impl PeerStore {
                 }
                 occ.get_mut().push(StoredPeer {
                     addr,
-                    time: Utc::now(),
+                    time: OffsetDateTime::now_utc(),
                 });
             }
             Entry::Vacant(vac) => {
@@ -174,7 +176,7 @@ impl PeerStore {
                 }
                 vac.insert(vec![StoredPeer {
                     addr,
-                    time: Utc::now(),
+                    time: OffsetDateTime::now_utc(),
                 }]);
             }
         }
@@ -204,5 +206,24 @@ impl PeerStore {
     #[allow(dead_code)]
     pub fn garbage_collect_peers(&self) {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoredPeer;
+
+    #[test]
+    fn stored_peer_time_round_trips_and_reads_chrono_era_rfc3339() {
+        // Exactly what chrono's DateTime<Utc> wrote into persisted dht.json.
+        let persisted = r#"{"addr":"192.0.2.7:6881","time":"2026-11-17T10:26:22.068439123Z"}"#;
+        let peer: StoredPeer = serde_json::from_str(persisted).unwrap();
+        assert_eq!(peer.time.unix_timestamp(), 1_794_911_182);
+        assert_eq!(peer.time.nanosecond(), 68_439_123);
+        let written = serde_json::to_string(&peer).unwrap();
+        assert_eq!(
+            serde_json::from_str::<StoredPeer>(&written).unwrap().time,
+            peer.time
+        );
     }
 }
