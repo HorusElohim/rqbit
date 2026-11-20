@@ -87,30 +87,53 @@ pub fn get_local_ip_relative_to(
     bail!("couldn't find a local ip address")
 }
 
+/// Candidate external ports for `(local_ip, internal_port)`: `internal_port`
+/// first, then deterministic high ports (`49152..=65534`) hashed from the
+/// client IP and internal port. Two devices on the same Wi-Fi that both listen
+/// on `6881` (for example a MacBook and an iPhone) therefore keep stable,
+/// non-colliding external leases when `6881` returns UPnP `718`.
+pub fn preferred_external_ports(local_ip: IpAddr, internal_port: u16) -> Vec<u16> {
+    let mut ports = vec![internal_port];
+    let mut seed: u64 = 0xcbf2_9ce4_8422_2325;
+    let mix = |state: &mut u64, byte: u8| {
+        *state ^= u64::from(byte);
+        *state = state.wrapping_mul(0x0100_0000_01b3);
+    };
+    match local_ip {
+        IpAddr::V4(v4) => v4.octets().into_iter().for_each(|b| mix(&mut seed, b)),
+        IpAddr::V6(v6) => v6.octets().into_iter().for_each(|b| mix(&mut seed, b)),
+    }
+    internal_port
+        .to_be_bytes()
+        .into_iter()
+        .for_each(|b| mix(&mut seed, b));
+
+    const BASE: u64 = 49_152;
+    const SPAN: u64 = 65_535 - BASE;
+    for slot in 0u8..8 {
+        let mut h = seed;
+        mix(&mut h, slot);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        let candidate = (BASE + (h % SPAN)) as u16;
+        if !ports.contains(&candidate) {
+            ports.push(candidate);
+        }
+    }
+    ports
+}
+
 async fn forward_port(
     connection: &WanConnection,
     local_ip: IpAddr,
     port: u16,
     lease_duration: Duration,
 ) -> anyhow::Result<()> {
-    let arguments = format!(
-        "<NewRemoteHost></NewRemoteHost>\
-         <NewExternalPort>{port}</NewExternalPort>\
-         <NewProtocol>TCP</NewProtocol>\
-         <NewInternalPort>{port}</NewInternalPort>\
-         <NewInternalClient>{local_ip}</NewInternalClient>\
-         <NewEnabled>1</NewEnabled>\
-         <NewPortMappingDescription>rust UPnP</NewPortMappingDescription>\
-         <NewLeaseDuration>{}</NewLeaseDuration>",
-        lease_duration.as_secs()
-    );
-    let (status, response_text) = soap_request(connection, "AddPortMapping", &arguments).await?;
-    trace!(status = %status, text=response_text, "AddPortMapping response");
-    if !status.is_success() {
-        bail!("failed port forwarding: {}", status);
-    } else {
-        debug!(%local_ip, port, "successfully port forwarded");
-    }
+    let external_port = connection
+        .ensure_tcp_port_mapping(local_ip, port, lease_duration)
+        .await?;
+    debug!(%local_ip, internal_port = port, external_port, "successfully port forwarded");
     Ok(())
 }
 
@@ -201,6 +224,105 @@ impl WanConnection {
         );
         let (status, body) = soap_request(self, "GetSpecificPortMappingEntry", &arguments).await?;
         parse_port_mapping(status.is_success(), &body)
+    }
+
+    /// Finds the active external TCP port this gateway forwards to
+    /// `(local_ip, internal_port)`, checking `internal_port` and its
+    /// deterministic conflict-fallback slots.
+    pub async fn tcp_external_port_for(
+        &self,
+        local_ip: IpAddr,
+        internal_port: u16,
+    ) -> anyhow::Result<Option<u16>> {
+        for ext_port in preferred_external_ports(local_ip, internal_port) {
+            if let Some(mapping) = self.tcp_port_mapping(ext_port).await?
+                && mapping.enabled
+                && mapping.internal_client == local_ip
+                && mapping.internal_port == internal_port
+            {
+                return Ok(Some(ext_port));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Leases an external TCP port forwarding to `(local_ip, internal_port)`.
+    /// Prefers `internal_port`; if another LAN device already holds it (UPnP
+    /// `718 ConflictInMappingEntry`), falls back through deterministic high
+    /// ports. Retries with `NewLeaseDuration = 0` when a gateway returns `725`
+    /// (`OnlyPermanentLeasesSupported`).
+    pub async fn ensure_tcp_port_mapping(
+        &self,
+        local_ip: IpAddr,
+        internal_port: u16,
+        lease_duration: Duration,
+    ) -> anyhow::Result<u16> {
+        for ext_port in preferred_external_ports(local_ip, internal_port) {
+            let (status, body) = self
+                .add_tcp_mapping_call(local_ip, ext_port, internal_port, lease_duration.as_secs())
+                .await?;
+            if status.is_success() {
+                return Ok(ext_port);
+            }
+            match soap_value(&body, "errorCode") {
+                Some("725") => {
+                    let (retry_status, retry_body) = self
+                        .add_tcp_mapping_call(local_ip, ext_port, internal_port, 0)
+                        .await?;
+                    if retry_status.is_success() {
+                        return Ok(ext_port);
+                    }
+                    if soap_value(&retry_body, "errorCode") == Some("718") {
+                        continue;
+                    }
+                    bail!(
+                        "AddPortMapping failed after permanent-lease retry: {} ({})",
+                        retry_status,
+                        soap_value(&retry_body, "errorDescription").unwrap_or("unknown error")
+                    );
+                }
+                Some("718") => {
+                    debug!(
+                        %local_ip,
+                        internal_port,
+                        ext_port,
+                        "external port already leased by another LAN host; trying fallback port"
+                    );
+                    continue;
+                }
+                code => {
+                    bail!(
+                        "AddPortMapping failed: {} ({:?}: {})",
+                        status,
+                        code,
+                        soap_value(&body, "errorDescription").unwrap_or("unknown error")
+                    );
+                }
+            }
+        }
+        bail!("all candidate UPnP external ports conflicted on gateway")
+    }
+
+    async fn add_tcp_mapping_call(
+        &self,
+        local_ip: IpAddr,
+        external_port: u16,
+        internal_port: u16,
+        lease_secs: u64,
+    ) -> anyhow::Result<(reqwest::StatusCode, String)> {
+        let arguments = format!(
+            "<NewRemoteHost></NewRemoteHost>\
+             <NewExternalPort>{external_port}</NewExternalPort>\
+             <NewProtocol>TCP</NewProtocol>\
+             <NewInternalPort>{internal_port}</NewInternalPort>\
+             <NewInternalClient>{local_ip}</NewInternalClient>\
+             <NewEnabled>1</NewEnabled>\
+             <NewPortMappingDescription>Portalis</NewPortMappingDescription>\
+             <NewLeaseDuration>{lease_secs}</NewLeaseDuration>"
+        );
+        let res = soap_request(self, "AddPortMapping", &arguments).await?;
+        trace!(status = %res.0, text = res.1, "AddPortMapping response");
+        Ok(res)
     }
 }
 
@@ -631,7 +753,7 @@ impl Default for UpnpPortForwarderOptions {
         Self {
             discover_interval: Duration::from_secs(30),
             discover_timeout: Duration::from_secs(10),
-            lease_duration: Duration::from_secs(60),
+            lease_duration: Duration::from_secs(120),
         }
     }
 }
@@ -727,7 +849,7 @@ impl UpnpPortForwarder {
         let (discover_tx, mut discover_rx) = unbounded_channel();
         let discovery = self.discovery(discover_tx);
 
-        let mut spawned_tasks = HashSet::<Url>::new();
+        let mut spawned_tasks = HashSet::<(Url, IpAddr)>::new();
 
         let mut endpoints = FuturesUnordered::new();
         let mut service_managers = FuturesUnordered::new();
@@ -746,28 +868,19 @@ impl UpnpPortForwarder {
                     }).instrument(debug_span!("parse endpoint", location=location.to_string())));
                 },
                 Some(Ok(endpoint)) = endpoints.next(), if !endpoints.is_empty() => {
-                    let mut local_ip = None;
-                    for (span, connection) in endpoint.port_mapping_services() {
-                        if spawned_tasks.contains(&connection.control_url) {
-                            debug!("already spawned for {}", connection.control_url);
+                    let ip = match endpoint.my_local_ip() {
+                        Ok(ip) => ip,
+                        Err(e) => {
+                            warn!("failed to determine local IP for endpoint at {}: {:#}", endpoint.location(), e);
                             continue;
                         }
-                        let ip = match local_ip {
-                            Some(ip) => ip,
-                            None => {
-                                match endpoint.my_local_ip() {
-                                    Ok(ip) => {
-                                        local_ip = Some(ip);
-                                        ip
-                                    },
-                                    Err(e) => {
-                                        warn!("failed to determine local IP for endpoint at {}: {:#}", endpoint.location(), e);
-                                        break;
-                                    }
-                                }
-                            }
-                        };
-                        spawned_tasks.insert(connection.control_url.clone());
+                    };
+                    for (span, connection) in endpoint.port_mapping_services() {
+                        let key = (connection.control_url.clone(), ip);
+                        if !spawned_tasks.insert(key) {
+                            debug!("already spawned for {} ({ip})", connection.control_url);
+                            continue;
+                        }
                         service_managers.push(self.manage_service(connection, ip).instrument(span))
                     }
                 },
@@ -989,6 +1102,99 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "duplicate location must be deduplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_on_default_port_leases_and_reads_deterministic_fallback_port() {
+        use std::io::{Read, Write};
+        use std::net::IpAddr;
+        use std::time::Duration;
+
+        let mac_ip: IpAddr = "192.168.1.15".parse().unwrap();
+        let iphone_ip: IpAddr = "192.168.1.42".parse().unwrap();
+        let iphone_candidates = super::preferred_external_ports(iphone_ip, 6881);
+        assert_eq!(iphone_candidates[0], 6881);
+        let fallback_port = iphone_candidates[1];
+        assert!(fallback_port >= 49_152);
+
+        // Minimal SOAP responder: 6881 is already held by `mac_ip` (returns 718
+        // when `iphone_ip` asks for 6881); `fallback_port` requires permanent
+        // lease on first try (725), succeeds on lease=0, and answers lookup.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut leased_fallback = false;
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let (code, body) = if req.contains("AddPortMapping") {
+                    if req.contains("<NewExternalPort>6881</NewExternalPort>") {
+                        (
+                            "500 Internal Server Error",
+                            "<errorCode>718</errorCode><errorDescription>ConflictInMappingEntry</errorDescription>".to_owned(),
+                        )
+                    } else if req.contains(&format!(
+                        "<NewExternalPort>{fallback_port}</NewExternalPort>"
+                    )) && !req.contains("<NewLeaseDuration>0</NewLeaseDuration>")
+                    {
+                        (
+                            "500 Internal Server Error",
+                            "<errorCode>725</errorCode><errorDescription>OnlyPermanentLeasesSupported</errorDescription>".to_owned(),
+                        )
+                    } else {
+                        leased_fallback = true;
+                        ("200 OK", "<u:AddPortMappingResponse/>".to_owned())
+                    }
+                } else if req.contains("<NewExternalPort>6881</NewExternalPort>") {
+                    (
+                        "200 OK",
+                        format!(
+                            "<NewInternalPort>6881</NewInternalPort><NewInternalClient>{mac_ip}</NewInternalClient><NewEnabled>1</NewEnabled>"
+                        ),
+                    )
+                } else if leased_fallback
+                    && req.contains(&format!(
+                        "<NewExternalPort>{fallback_port}</NewExternalPort>"
+                    ))
+                {
+                    (
+                        "200 OK",
+                        format!(
+                            "<NewInternalPort>6881</NewInternalPort><NewInternalClient>{iphone_ip}</NewInternalClient><NewEnabled>1</NewEnabled>"
+                        ),
+                    )
+                } else {
+                    (
+                        "500 Internal Server Error",
+                        "<errorCode>714</errorCode><errorDescription>NoSuchEntryInArray</errorDescription>".to_owned(),
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 {code}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let gw = super::WanConnection {
+            control_url: format!("http://{addr}/ctl/IPConn").parse().unwrap(),
+            service_type: "urn:schemas-upnp-org:service:WANIPConnection:2",
+        };
+        assert_eq!(
+            gw.tcp_external_port_for(iphone_ip, 6881).await.unwrap(),
+            None
+        );
+        let leased = gw
+            .ensure_tcp_port_mapping(iphone_ip, 6881, Duration::from_secs(120))
+            .await
+            .unwrap();
+        assert_eq!(leased, fallback_port);
+        assert_eq!(
+            gw.tcp_external_port_for(iphone_ip, 6881).await.unwrap(),
+            Some(fallback_port)
         );
     }
 }
