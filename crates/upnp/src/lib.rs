@@ -88,52 +88,23 @@ pub fn get_local_ip_relative_to(
 }
 
 async fn forward_port(
-    control_url: Url,
-    service_type: &str,
+    connection: &WanConnection,
     local_ip: IpAddr,
     port: u16,
     lease_duration: Duration,
 ) -> anyhow::Result<()> {
-    let request_body = format!(
-        r#"
-        <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
-            s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-            <s:Body>
-                <u:AddPortMapping xmlns:u="{service_type}">
-                    <NewRemoteHost></NewRemoteHost>
-                    <NewExternalPort>{port}</NewExternalPort>
-                    <NewProtocol>TCP</NewProtocol>
-                    <NewInternalPort>{port}</NewInternalPort>
-                    <NewInternalClient>{local_ip}</NewInternalClient>
-                    <NewEnabled>1</NewEnabled>
-                    <NewPortMappingDescription>rust UPnP</NewPortMappingDescription>
-                    <NewLeaseDuration>{}</NewLeaseDuration>
-                </u:AddPortMapping>
-            </s:Body>
-        </s:Envelope>
-    "#,
+    let arguments = format!(
+        "<NewRemoteHost></NewRemoteHost>\
+         <NewExternalPort>{port}</NewExternalPort>\
+         <NewProtocol>TCP</NewProtocol>\
+         <NewInternalPort>{port}</NewInternalPort>\
+         <NewInternalClient>{local_ip}</NewInternalClient>\
+         <NewEnabled>1</NewEnabled>\
+         <NewPortMappingDescription>rust UPnP</NewPortMappingDescription>\
+         <NewLeaseDuration>{}</NewLeaseDuration>",
         lease_duration.as_secs()
     );
-
-    let url = control_url;
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post(url.clone())
-        .header("Content-Type", "text/xml")
-        .header("SOAPAction", format!("\"{service_type}#AddPortMapping\""))
-        .body(request_body)
-        .send()
-        .await
-        .context("error sending")?;
-
-    let status = response.status();
-
-    let response_text = response
-        .text()
-        .await
-        .context("error reading response text")?;
-
+    let (status, response_text) = soap_request(connection, "AddPortMapping", &arguments).await?;
     trace!(status = %status, text=response_text, "AddPortMapping response");
     if !status.is_success() {
         bail!("failed port forwarding: {}", status);
@@ -141,6 +112,180 @@ async fn forward_port(
         debug!(%local_ip, port, "successfully port forwarded");
     }
     Ok(())
+}
+
+/// Calls one action on a WAN connection service, addressed by its own type.
+async fn soap_request(
+    connection: &WanConnection,
+    action: &str,
+    arguments: &str,
+) -> anyhow::Result<(reqwest::StatusCode, String)> {
+    let service_type = connection.service_type;
+    let request_body = format!(
+        r#"<?xml version="1.0"?>
+        <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+            s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+            <s:Body><u:{action} xmlns:u="{service_type}">{arguments}</u:{action}></s:Body>
+        </s:Envelope>"#
+    );
+    let response = Client::new()
+        .post(connection.control_url.clone())
+        .header("Content-Type", "text/xml")
+        .header("SOAPAction", format!("\"{service_type}#{action}\""))
+        .body(request_body)
+        .send()
+        .await
+        .context("error sending")?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("error reading response text")?;
+    Ok((status, text))
+}
+
+/// The text of the first `<tag>` element in a SOAP body. UPnP response
+/// arguments are unqualified, though some gateways add attributes.
+fn soap_value<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}");
+    let mut from = 0;
+    let start = loop {
+        let at = from + body[from..].find(&open)? + open.len();
+        match body[at..].chars().next()? {
+            '>' => break at + 1,
+            c if c.is_whitespace() => break at + body[at..].find('>')? + 1,
+            _ => from = at,
+        }
+    };
+    let end = body[start..].find(&format!("</{tag}>"))?;
+    Some(body[start..start + end].trim())
+}
+
+/// A WAN connection service a gateway lists, addressed by the type it lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WanConnection {
+    pub control_url: Url,
+    pub service_type: &'static str,
+}
+
+/// A TCP port mapping a gateway holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortMapping {
+    pub internal_client: IpAddr,
+    pub internal_port: u16,
+    pub enabled: bool,
+}
+
+impl WanConnection {
+    /// The gateway's own internet-facing address.
+    pub async fn external_ip(&self) -> anyhow::Result<IpAddr> {
+        let (status, body) = soap_request(self, "GetExternalIPAddress", "").await?;
+        if !status.is_success() {
+            bail!("GetExternalIPAddress failed: {status}");
+        }
+        soap_value(&body, "NewExternalIPAddress")
+            .context("missing NewExternalIPAddress")?
+            .parse()
+            .context("bad NewExternalIPAddress")
+    }
+
+    /// The TCP mapping this gateway holds for `external_port`, if any.
+    pub async fn tcp_port_mapping(
+        &self,
+        external_port: u16,
+    ) -> anyhow::Result<Option<PortMapping>> {
+        let arguments = format!(
+            "<NewRemoteHost></NewRemoteHost>\
+             <NewExternalPort>{external_port}</NewExternalPort>\
+             <NewProtocol>TCP</NewProtocol>"
+        );
+        let (status, body) = soap_request(self, "GetSpecificPortMappingEntry", &arguments).await?;
+        parse_port_mapping(status.is_success(), &body)
+    }
+}
+
+fn parse_port_mapping(success: bool, body: &str) -> anyhow::Result<Option<PortMapping>> {
+    if !success {
+        // UPnP error 714, NoSuchEntryInArray: the gateway holds no such mapping.
+        if soap_value(body, "errorCode") == Some("714") {
+            return Ok(None);
+        }
+        bail!(
+            "GetSpecificPortMappingEntry failed: {}",
+            soap_value(body, "errorDescription").unwrap_or("unknown error")
+        );
+    }
+    let value = |tag| soap_value(body, tag).with_context(|| format!("missing {tag}"));
+    Ok(Some(PortMapping {
+        internal_client: value("NewInternalClient")?.parse()?,
+        internal_port: value("NewInternalPort")?.parse()?,
+        enabled: !matches!(value("NewEnabled")?, "0" | "false"),
+    }))
+}
+
+/// Every WAN connection service on this network, gathered for `timeout` from
+/// every gateway that answers — not only the first: an access point running
+/// its own UPnP can answer before the router that matters.
+pub async fn discover_wan_connections(
+    timeout: Duration,
+    bind_device: Option<&BindDevice>,
+) -> anyhow::Result<Vec<WanConnection>> {
+    let (tx, mut rx) = unbounded_channel();
+    discover_once(&tx, SSDP_SEARCH_GATEWAY_ST, timeout, bind_device).await?;
+    let mut locations = Vec::new();
+    while let Ok(response) = rx.try_recv() {
+        if !locations.contains(&response.location) {
+            locations.push(response.location);
+        }
+    }
+    let described = futures::future::join_all(locations.into_iter().map(|location| async move {
+        let description = tokio::time::timeout(timeout, discover_services(location.clone()))
+            .await
+            .ok()?
+            .inspect_err(|e| debug!("error describing {location}: {e:#}"))
+            .ok()?;
+        let span = debug_span!("upnp_gateway", location = %location);
+        Some(
+            wan_connections(&location, &description, span)
+                .map(|(_, connection)| connection)
+                .collect::<Vec<_>>(),
+        )
+    }))
+    .await;
+    Ok(described.into_iter().flatten().flatten().collect())
+}
+
+/// The WAN connection services a gateway's description lists.
+fn wan_connections<'a>(
+    location: &'a Url,
+    description: &'a RootDesc,
+    span: Span,
+) -> impl Iterator<Item = (Span, WanConnection)> + 'a {
+    description
+        .devices
+        .iter()
+        .flat_map(move |device| device.iter_services(span.clone()))
+        .filter_map(|(span, service)| {
+            let service_type = PORT_MAPPING_SERVICE_TYPES
+                .into_iter()
+                .find(|known| *known == service.service_type)?;
+            Some((span, service, service_type))
+        })
+        .filter_map(move |(span, service, service_type)| {
+            match location.join(&service.control_url) {
+                Ok(control_url) => Some((
+                    span,
+                    WanConnection {
+                        control_url,
+                        service_type,
+                    },
+                )),
+                Err(e) => {
+                    debug!("bad control url: {e:#}");
+                    None
+                }
+            }
+        })
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -237,14 +382,6 @@ impl UpnpEndpoint {
         debug_span!("upnp_endpoint", location = %self.location())
     }
 
-    fn iter_services(&self) -> impl Iterator<Item = (tracing::Span, &Service)> + '_ {
-        let self_span = self.span();
-        self.data
-            .devices
-            .iter()
-            .flat_map(move |d| d.iter_services(self_span.clone()))
-    }
-
     fn my_local_ip(&self) -> anyhow::Result<IpAddr> {
         let received_from = self.discover_response.received_from;
         let local_ip = get_local_ip_relative_to(received_from, &self.nics)
@@ -252,27 +389,8 @@ impl UpnpEndpoint {
         Ok(local_ip)
     }
 
-    fn port_mapping_services(
-        &self,
-    ) -> impl Iterator<Item = (tracing::Span, Url, &'static str)> + '_ {
-        self.iter_services()
-            .filter_map(|(span, s)| {
-                let service_type = PORT_MAPPING_SERVICE_TYPES
-                    .into_iter()
-                    .find(|known| *known == s.service_type)?;
-                Some((span, s, service_type))
-            })
-            .map(|(span, s, service_type)| {
-                let url = self.discover_response.location.join(&s.control_url);
-                (span, url, service_type)
-            })
-            .filter_map(|(span, url, service_type)| match url {
-                Ok(url) => Some((span, url, service_type)),
-                Err(e) => {
-                    debug!("bad control url: {e:#}");
-                    None
-                }
-            })
+    fn port_mapping_services(&self) -> impl Iterator<Item = (Span, WanConnection)> + '_ {
+        wan_connections(self.location(), &self.data, self.span())
     }
 }
 
@@ -461,28 +579,14 @@ impl UpnpPortForwarder {
         }
     }
 
-    async fn manage_port(
-        &self,
-        control_url: Url,
-        service_type: &'static str,
-        local_ip: IpAddr,
-        port: u16,
-    ) -> ! {
+    async fn manage_port(&self, connection: &WanConnection, local_ip: IpAddr, port: u16) -> ! {
         let lease_duration = self.opts.lease_duration;
         let mut interval = tokio::time::interval(lease_duration / 2);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             interval.tick().await;
-            if let Err(e) = forward_port(
-                control_url.clone(),
-                service_type,
-                local_ip,
-                port,
-                lease_duration,
-            )
-            .await
-            {
+            if let Err(e) = forward_port(connection, local_ip, port, lease_duration).await {
                 warn!("failed to forward port: {e:#}");
             }
         }
@@ -490,12 +594,11 @@ impl UpnpPortForwarder {
 
     async fn manage_service(
         &self,
-        control_url: Url,
-        service_type: &'static str,
+        connection: WanConnection,
         local_ip: IpAddr,
     ) -> anyhow::Result<()> {
         futures::future::join_all(self.ports.iter().cloned().map(|port| {
-            self.manage_port(control_url.clone(), service_type, local_ip, port)
+            self.manage_port(&connection, local_ip, port)
                 .instrument(debug_span!("manage_port", port = port))
         }))
         .await;
@@ -526,9 +629,9 @@ impl UpnpPortForwarder {
                 },
                 Some(Ok(endpoint)) = endpoints.next(), if !endpoints.is_empty() => {
                     let mut local_ip = None;
-                    for (span, control_url, service_type) in endpoint.port_mapping_services() {
-                        if spawned_tasks.contains(&control_url) {
-                            debug!("already spawned for {}", control_url);
+                    for (span, connection) in endpoint.port_mapping_services() {
+                        if spawned_tasks.contains(&connection.control_url) {
+                            debug!("already spawned for {}", connection.control_url);
                             continue;
                         }
                         let ip = match local_ip {
@@ -546,8 +649,8 @@ impl UpnpPortForwarder {
                                 }
                             }
                         };
-                        spawned_tasks.insert(control_url.clone());
-                        service_managers.push(self.manage_service(control_url, service_type, ip).instrument(span))
+                        spawned_tasks.insert(connection.control_url.clone());
+                        service_managers.push(self.manage_service(connection, ip).instrument(span))
                     }
                 },
                 _ = service_managers.next(), if !service_managers.is_empty() => {
@@ -563,7 +666,8 @@ mod tests {
     use quick_xml::de::from_str;
 
     use crate::{
-        Device, DeviceList, RootDesc, Service, ServiceList, UpnpDiscoverResponse, UpnpEndpoint,
+        Device, DeviceList, PortMapping, RootDesc, Service, ServiceList, UpnpDiscoverResponse,
+        UpnpEndpoint, parse_port_mapping, soap_value,
     };
 
     fn endpoint(description: &str) -> UpnpEndpoint {
@@ -580,8 +684,37 @@ mod tests {
     fn port_mapping_services(description: &str) -> Vec<(String, &'static str)> {
         endpoint(description)
             .port_mapping_services()
-            .map(|(_, url, service_type)| (url.to_string(), service_type))
+            .map(|(_, connection)| (connection.control_url.to_string(), connection.service_type))
             .collect()
+    }
+
+    #[test]
+    fn soap_values_are_read_with_or_without_attributes() {
+        let body = r#"<u:R><NewExternalIPAddressX>no</NewExternalIPAddressX><NewExternalIPAddress xmlns:dt="urn:schemas-microsoft-com:datatypes" dt:dt="string"> 203.0.113.9 </NewExternalIPAddress></u:R>"#;
+        assert_eq!(
+            soap_value(body, "NewExternalIPAddress"),
+            Some("203.0.113.9")
+        );
+        assert_eq!(soap_value("<a>1</a>", "b"), None);
+    }
+
+    #[test]
+    fn a_missing_mapping_is_absent_not_an_error() {
+        let held = "<NewInternalPort>6881</NewInternalPort><NewInternalClient>192.168.1.5</NewInternalClient><NewEnabled>1</NewEnabled>";
+        assert_eq!(
+            parse_port_mapping(true, held).unwrap(),
+            Some(PortMapping {
+                internal_client: "192.168.1.5".parse().unwrap(),
+                internal_port: 6881,
+                enabled: true,
+            })
+        );
+        let absent =
+            "<errorCode>714</errorCode><errorDescription>NoSuchEntryInArray</errorDescription>";
+        assert_eq!(parse_port_mapping(false, absent).unwrap(), None);
+        let refused =
+            "<errorCode>606</errorCode><errorDescription>Action not authorized</errorDescription>";
+        assert!(parse_port_mapping(false, refused).is_err());
     }
 
     #[test]
