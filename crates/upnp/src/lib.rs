@@ -128,7 +128,7 @@ async fn soap_request(
             <s:Body><u:{action} xmlns:u="{service_type}">{arguments}</u:{action}></s:Body>
         </s:Envelope>"#
     );
-    let response = Client::new()
+    let response = http_client()?
         .post(connection.control_url.clone())
         .header("Content-Type", "text/xml")
         .header("SOAPAction", format!("\"{service_type}#{action}\""))
@@ -400,8 +400,15 @@ pub struct UpnpDiscoverResponse {
     pub location: Url,
 }
 
+fn http_client() -> anyhow::Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to build UPnP HTTP client")
+}
+
 pub async fn discover_services(location: Url) -> anyhow::Result<RootDesc> {
-    let response = Client::new()
+    let response = http_client()?
         .get(location.clone())
         .send()
         .await
@@ -451,55 +458,166 @@ pub fn parse_upnp_discover_response(
     })
 }
 
+const SSDP_PORT: u16 = 1900;
+
+/// Common router IPv4 addresses on an interface's subnet (`.1`, `.254`, `.138`).
+///
+/// On iOS, sending UDP multicast to `239.255.255.250:1900` fails without
+/// Apple's restricted `com.apple.developer.networking.multicast` entitlement,
+/// whereas ordinary `NSLocalNetworkUsageDescription` permits unicast UDP to
+/// LAN gateways (UPnP Device Architecture §1.3.2 unicast `M-SEARCH`).
+pub(crate) fn subnet_gateway_candidates(
+    iface_ip: Ipv4Addr,
+    netmask: Option<Ipv4Addr>,
+) -> Vec<Ipv4Addr> {
+    let mask = netmask.unwrap_or(Ipv4Addr::new(255, 255, 255, 0)).to_bits();
+    let host_mask = !mask;
+    if host_mask < 3 {
+        return Vec::new();
+    }
+    let ip = iface_ip.to_bits();
+    let net = ip & mask;
+    let bcast = ip | host_mask;
+    let mut raw = vec![net + 1, bcast - 1];
+    if mask < 0xffff_ff00 {
+        let slash24 = ip & 0xffff_ff00;
+        raw.push(slash24 | 1);
+        raw.push(slash24 | 254);
+    }
+    if host_mask >= 255 {
+        raw.push(net + 138);
+    }
+    let mut out = Vec::new();
+    for candidate in raw.into_iter().map(Ipv4Addr::from) {
+        if candidate != iface_ip
+            && candidate.to_bits() != net
+            && candidate.to_bits() != bcast
+            && !out.contains(&candidate)
+        {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+async fn send_probes_and_collect(
+    sockets_and_targets: Vec<(UdpSocket, Vec<SocketAddr>)>,
+    message: &[u8],
+    tx: &UnboundedSender<UpnpDiscoverResponse>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let mut active_sockets = Vec::new();
+    let mut sent = 0usize;
+
+    for (socket, targets) in sockets_and_targets {
+        let mut socket_sent = false;
+        for target in targets {
+            match socket.send_to(message, target).await {
+                Ok(_) => {
+                    sent += 1;
+                    socket_sent = true;
+                }
+                Err(e) => {
+                    debug!(%target, "SSDP M-SEARCH send failed: {e:#}");
+                }
+            }
+        }
+        if socket_sent {
+            active_sockets.push(socket);
+        }
+    }
+
+    if sent == 0 {
+        bail!("failed to send SSDP search request on any local interface");
+    }
+
+    let seen = std::sync::Mutex::new(HashSet::<Url>::new());
+    let _ = tokio::time::timeout(
+        timeout,
+        futures::future::join_all(active_sockets.iter().map(|socket| {
+            let seen = &seen;
+            async move {
+                let mut buffer = [0u8; 2048];
+                loop {
+                    match socket.recv_from(&mut buffer).await {
+                        Ok((len, addr)) => {
+                            match parse_upnp_discover_response(&buffer[..len], addr) {
+                                Ok(r) => {
+                                    if seen.lock().unwrap().insert(r.location.clone())
+                                        && tx.send(r).is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(e) => warn!(
+                                    response = ?BStr::new(&buffer[..len]),
+                                    "failed to parse SSDP response: {e:#}"
+                                ),
+                            }
+                        }
+                        Err(e) => {
+                            debug!("SSDP recv_from ended: {e:#}");
+                            break;
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    debug!("discovered {} endpoints", seen.lock().unwrap().len());
+    Ok(())
+}
+
 pub async fn discover_once(
     tx: &UnboundedSender<UpnpDiscoverResponse>,
     kind: &str,
     timeout: Duration,
     bind_device: Option<&BindDevice>,
 ) -> anyhow::Result<()> {
-    // TODO: do we need IPv6 support here? I can't test it, don't have the hardware for it (router / IPv6 provider).
-    let socket = UdpSocket::bind_udp(
-        (Ipv4Addr::UNSPECIFIED, 0).into(),
-        librqbit_dualstack_sockets::BindOpts {
-            device: bind_device,
-            ..Default::default()
-        },
-    )?;
-
     let message = make_ssdp_search_request(kind);
-    socket
-        .send_to(message.as_bytes(), SSDP_MULTICAST_IP)
-        .await
-        .with_context(|| format!("failed to send SSDP search request to {SSDP_MULTICAST_IP}"))?;
+    let bind_opts = librqbit_dualstack_sockets::BindOpts {
+        device: bind_device,
+        ..Default::default()
+    };
 
-    let mut buffer = [0; 2048];
-
-    let timeout = tokio::time::sleep(timeout);
-    let mut timed_out = false;
-    tokio::pin!(timeout);
-
-    let mut discovered = 0;
-
-    while !timed_out {
-        tokio::select! {
-            _ = &mut timeout, if !timed_out => {
-                timed_out = true;
+    let mut sockets_and_targets = Vec::new();
+    for nic in NetworkInterface::show().into_iter().flatten() {
+        if bind_device.is_some_and(|bd| bd.index().get() != nic.index) {
+            continue;
+        }
+        for addr in &nic.addr {
+            let IpAddr::V4(iface_ip) = addr.ip() else {
+                continue;
+            };
+            if !iface_ip.is_private() {
+                continue;
             }
-            Ok((len, addr)) = socket.recv_from(&mut buffer), if !timed_out => {
-                let response = &buffer[..len];
-                match parse_upnp_discover_response(response, addr) {
-                    Ok(r) => {
-                        tx.send(r)?;
-                        discovered += 1;
-                    },
-                    Err(e) => warn!(response=?BStr::new(response), "failed to parse SSDP response: {e:#}"),
-                };
-            },
+            let netmask = match addr.netmask() {
+                Some(IpAddr::V4(m)) => Some(m),
+                _ => None,
+            };
+            let Ok(socket) = UdpSocket::bind_udp((iface_ip, 0).into(), bind_opts) else {
+                continue;
+            };
+            let _ = socket2::SockRef::from(socket.socket()).set_multicast_if_v4(&iface_ip);
+            let mut targets = vec![SSDP_MULTICAST_IP];
+            targets.extend(
+                subnet_gateway_candidates(iface_ip, netmask)
+                    .into_iter()
+                    .map(|gw| SocketAddr::V4(SocketAddrV4::new(gw, SSDP_PORT))),
+            );
+            sockets_and_targets.push((socket, targets));
         }
     }
 
-    debug!("discovered {discovered} endpoints");
-    Ok(())
+    if sockets_and_targets.is_empty() {
+        let socket = UdpSocket::bind_udp((Ipv4Addr::UNSPECIFIED, 0).into(), bind_opts)?;
+        sockets_and_targets.push((socket, vec![SSDP_MULTICAST_IP]));
+    }
+
+    send_probes_and_collect(sockets_and_targets, message.as_bytes(), tx, timeout).await
 }
 
 pub struct UpnpPortForwarderOptions {
@@ -511,7 +629,7 @@ pub struct UpnpPortForwarderOptions {
 impl Default for UpnpPortForwarderOptions {
     fn default() -> Self {
         Self {
-            discover_interval: Duration::from_secs(60),
+            discover_interval: Duration::from_secs(30),
             discover_timeout: Duration::from_secs(10),
             lease_duration: Duration::from_secs(60),
         }
@@ -789,5 +907,88 @@ mod tests {
             }],
         };
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn gateway_candidates_cover_home_and_hotspot_subnets() {
+        use std::net::Ipv4Addr;
+        // Home /24 (including .1, .254 like Bbox/Freebox/Livebox, and .138)
+        let home = super::subnet_gateway_candidates(
+            Ipv4Addr::new(192, 168, 1, 42),
+            Some(Ipv4Addr::new(255, 255, 255, 0)),
+        );
+        assert_eq!(
+            home,
+            vec![
+                Ipv4Addr::new(192, 168, 1, 1),
+                Ipv4Addr::new(192, 168, 1, 254),
+                Ipv4Addr::new(192, 168, 1, 138),
+            ]
+        );
+
+        // iOS Personal Hotspot /28: never probes outside the /28
+        let hotspot = super::subnet_gateway_candidates(
+            Ipv4Addr::new(172, 20, 10, 2),
+            Some(Ipv4Addr::new(255, 255, 255, 240)),
+        );
+        assert_eq!(
+            hotspot,
+            vec![
+                Ipv4Addr::new(172, 20, 10, 1),
+                Ipv4Addr::new(172, 20, 10, 14),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unicast_probe_discovers_gateway_even_when_multicast_is_blocked() {
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+        use std::time::Duration;
+
+        // Fake router answering unicast M-SEARCH on 127.0.0.1:<port>
+        let router = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let router_addr = router.local_addr().unwrap();
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nST: {}\r\nLOCATION: http://127.0.0.1:38151/rootDesc.xml\r\n\r\n",
+            super::SSDP_SEARCH_GATEWAY_ST
+        );
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            if let Ok((_, peer)) = router.recv_from(&mut buf).await {
+                // Send twice to verify duplicate replies are deduplicated.
+                let _ = router.send_to(reply.as_bytes(), peer).await;
+                let _ = router.send_to(reply.as_bytes(), peer).await;
+            }
+        });
+
+        // Bind a loopback client socket: sending to non-loopback multicast
+        // 239.255.255.250:1900 from 127.0.0.1 fails with EINVAL/EADDRNOTAVAIL/
+        // ENETUNREACH just like unentitled multicast on iOS, while the unicast
+        // target succeeds.
+        let client = librqbit_dualstack_sockets::UdpSocket::bind_udp(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            Default::default(),
+        )
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let msg = super::make_ssdp_search_request(super::SSDP_SEARCH_GATEWAY_ST);
+        super::send_probes_and_collect(
+            vec![(client, vec![super::SSDP_MULTICAST_IP, router_addr])],
+            msg.as_bytes(),
+            &tx,
+            Duration::from_millis(150),
+        )
+        .await
+        .unwrap();
+
+        let first = rx.try_recv().expect("unicast gateway reply");
+        assert_eq!(
+            first.location.as_str(),
+            "http://127.0.0.1:38151/rootDesc.xml"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate location must be deduplicated"
+        );
     }
 }
