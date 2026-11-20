@@ -14,11 +14,21 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tracing::{Instrument, Span, debug, debug_span, trace, warn};
 use url::Url;
 
-const SERVICE_TYPE_WAN_IP_CONNECTION: &str = "urn:schemas-upnp-org:service:WANIPConnection:1";
+/// WAN connection services that lease port mappings. A gateway must be
+/// addressed by the exact type it lists: IGD v2 routers (common on current ISP
+/// boxes) list only `WANIPConnection:2`, and PPPoE routers `WANPPPConnection:1`.
+const PORT_MAPPING_SERVICE_TYPES: [&str; 3] = [
+    "urn:schemas-upnp-org:service:WANIPConnection:1",
+    "urn:schemas-upnp-org:service:WANIPConnection:2",
+    "urn:schemas-upnp-org:service:WANPPPConnection:1",
+];
 const SSDP_MULTICAST_IP: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 1900));
 pub const SSDP_SEARCH_WAN_IPCONNECTION_ST: &str = "urn:schemas-upnp-org:service:WANIPConnection:1";
 pub const SSDP_SEARCH_ROOT_ST: &str = "upnp:rootdevice";
+/// Every IGD v1 and v2 gateway answers this, whichever connection service it
+/// carries; a `WANIPConnection` search misses PPP-only gateways.
+pub const SSDP_SEARCH_GATEWAY_ST: &str = "urn:schemas-upnp-org:device:InternetGatewayDevice:1";
 
 pub fn make_ssdp_search_request(kind: &str) -> String {
     format!(
@@ -79,6 +89,7 @@ pub fn get_local_ip_relative_to(
 
 async fn forward_port(
     control_url: Url,
+    service_type: &str,
     local_ip: IpAddr,
     port: u16,
     lease_duration: Duration,
@@ -88,7 +99,7 @@ async fn forward_port(
         <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
             s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
             <s:Body>
-                <u:AddPortMapping xmlns:u="{SERVICE_TYPE_WAN_IP_CONNECTION}">
+                <u:AddPortMapping xmlns:u="{service_type}">
                     <NewRemoteHost></NewRemoteHost>
                     <NewExternalPort>{port}</NewExternalPort>
                     <NewProtocol>TCP</NewProtocol>
@@ -110,10 +121,7 @@ async fn forward_port(
     let response = client
         .post(url.clone())
         .header("Content-Type", "text/xml")
-        .header(
-            "SOAPAction",
-            format!("\"{SERVICE_TYPE_WAN_IP_CONNECTION}#AddPortMapping\""),
-        )
+        .header("SOAPAction", format!("\"{service_type}#AddPortMapping\""))
         .body(request_body)
         .send()
         .await
@@ -244,12 +252,22 @@ impl UpnpEndpoint {
         Ok(local_ip)
     }
 
-    fn get_wan_ip_control_urls(&self) -> impl Iterator<Item = (tracing::Span, Url)> + '_ {
+    fn port_mapping_services(
+        &self,
+    ) -> impl Iterator<Item = (tracing::Span, Url, &'static str)> + '_ {
         self.iter_services()
-            .filter(|(_, s)| s.service_type == SERVICE_TYPE_WAN_IP_CONNECTION)
-            .map(|(span, s)| (span, self.discover_response.location.join(&s.control_url)))
-            .filter_map(|(span, url)| match url {
-                Ok(url) => Some((span, url)),
+            .filter_map(|(span, s)| {
+                let service_type = PORT_MAPPING_SERVICE_TYPES
+                    .into_iter()
+                    .find(|known| *known == s.service_type)?;
+                Some((span, s, service_type))
+            })
+            .map(|(span, s, service_type)| {
+                let url = self.discover_response.location.join(&s.control_url);
+                (span, url, service_type)
+            })
+            .filter_map(|(span, url, service_type)| match url {
+                Ok(url) => Some((span, url, service_type)),
                 Err(e) => {
                     debug!("bad control url: {e:#}");
                     None
@@ -424,7 +442,7 @@ impl UpnpPortForwarder {
     ) -> anyhow::Result<()> {
         discover_once(
             tx,
-            SSDP_SEARCH_WAN_IPCONNECTION_ST,
+            SSDP_SEARCH_GATEWAY_ST,
             self.opts.discover_timeout,
             self.bind_device.as_ref(),
         )
@@ -443,23 +461,41 @@ impl UpnpPortForwarder {
         }
     }
 
-    async fn manage_port(&self, control_url: Url, local_ip: IpAddr, port: u16) -> ! {
+    async fn manage_port(
+        &self,
+        control_url: Url,
+        service_type: &'static str,
+        local_ip: IpAddr,
+        port: u16,
+    ) -> ! {
         let lease_duration = self.opts.lease_duration;
         let mut interval = tokio::time::interval(lease_duration / 2);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             interval.tick().await;
-            if let Err(e) = forward_port(control_url.clone(), local_ip, port, lease_duration).await
+            if let Err(e) = forward_port(
+                control_url.clone(),
+                service_type,
+                local_ip,
+                port,
+                lease_duration,
+            )
+            .await
             {
                 warn!("failed to forward port: {e:#}");
             }
         }
     }
 
-    async fn manage_service(&self, control_url: Url, local_ip: IpAddr) -> anyhow::Result<()> {
+    async fn manage_service(
+        &self,
+        control_url: Url,
+        service_type: &'static str,
+        local_ip: IpAddr,
+    ) -> anyhow::Result<()> {
         futures::future::join_all(self.ports.iter().cloned().map(|port| {
-            self.manage_port(control_url.clone(), local_ip, port)
+            self.manage_port(control_url.clone(), service_type, local_ip, port)
                 .instrument(debug_span!("manage_port", port = port))
         }))
         .await;
@@ -490,7 +526,7 @@ impl UpnpPortForwarder {
                 },
                 Some(Ok(endpoint)) = endpoints.next(), if !endpoints.is_empty() => {
                     let mut local_ip = None;
-                    for (span, control_url) in endpoint.get_wan_ip_control_urls() {
+                    for (span, control_url, service_type) in endpoint.port_mapping_services() {
                         if spawned_tasks.contains(&control_url) {
                             debug!("already spawned for {}", control_url);
                             continue;
@@ -511,7 +547,7 @@ impl UpnpPortForwarder {
                             }
                         };
                         spawned_tasks.insert(control_url.clone());
-                        service_managers.push(self.manage_service(control_url, ip).instrument(span))
+                        service_managers.push(self.manage_service(control_url, service_type, ip).instrument(span))
                     }
                 },
                 _ = service_managers.next(), if !service_managers.is_empty() => {
@@ -526,7 +562,49 @@ impl UpnpPortForwarder {
 mod tests {
     use quick_xml::de::from_str;
 
-    use crate::{Device, DeviceList, RootDesc, Service, ServiceList};
+    use crate::{
+        Device, DeviceList, RootDesc, Service, ServiceList, UpnpDiscoverResponse, UpnpEndpoint,
+    };
+
+    fn endpoint(description: &str) -> UpnpEndpoint {
+        UpnpEndpoint {
+            discover_response: UpnpDiscoverResponse {
+                received_from: "192.168.1.254:1900".parse().unwrap(),
+                location: "http://192.168.1.254:38151/rootDesc.xml".parse().unwrap(),
+            },
+            data: from_str(description).unwrap(),
+            nics: Vec::new(),
+        }
+    }
+
+    fn port_mapping_services(description: &str) -> Vec<(String, &'static str)> {
+        endpoint(description)
+            .port_mapping_services()
+            .map(|(_, url, service_type)| (url.to_string(), service_type))
+            .collect()
+    }
+
+    #[test]
+    fn igd_v1_gateway_maps_through_its_wan_ip_connection() {
+        assert_eq!(
+            port_mapping_services(include_str!("resources/test/devices-0.xml")),
+            [(
+                "http://192.168.1.254:38151/upnp/control/WANIPConnection0".to_owned(),
+                "urn:schemas-upnp-org:service:WANIPConnection:1"
+            )]
+        );
+    }
+
+    #[test]
+    fn igd_v2_gateway_maps_through_the_v2_service_it_lists() {
+        assert_eq!(
+            port_mapping_services(include_str!("resources/test/igd-v2.xml")),
+            [(
+                "http://192.168.1.254:38151/ctl/IPConn".to_owned(),
+                "urn:schemas-upnp-org:service:WANIPConnection:2"
+            )]
+        );
+    }
 
     #[test]
     fn test_parse_root_desc() {
