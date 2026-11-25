@@ -30,15 +30,30 @@ pub const SSDP_SEARCH_ROOT_ST: &str = "upnp:rootdevice";
 /// carries; a `WANIPConnection` search misses PPP-only gateways.
 pub const SSDP_SEARCH_GATEWAY_ST: &str = "urn:schemas-upnp-org:device:InternetGatewayDevice:1";
 
-pub fn make_ssdp_search_request(kind: &str) -> String {
+/// An SSDP search for `kind`. A gateway waits a random time of up to `mx`
+/// seconds before it answers, to spread replies out.
+pub fn make_ssdp_search_request(kind: &str, mx: u64) -> String {
     format!(
         "M-SEARCH * HTTP/1.1\r\n\
             Host: 239.255.255.250:1900\r\n\
             Man: \"ssdp:discover\"\r\n\
-            MX: 3\r\n\
+            MX: {mx}\r\n\
             ST: {kind}\r\n\
             \r\n"
     )
+}
+
+/// The MX for a search that listens for `window`. Gateways really do wait
+/// up to MX before answering, so it must fit inside the window with half a
+/// second left for the answer to arrive. A fixed MX of 3 made any window
+/// under about 3.5 s miss real routers, so failing on a network without UPnP
+/// could never be faster than that. 1 is the least UPnP allows; 3 stays the
+/// most, as before.
+fn search_mx(window: Duration) -> u64 {
+    window
+        .saturating_sub(Duration::from_millis(500))
+        .as_secs()
+        .clamp(1, 3)
 }
 
 pub fn get_local_ip_relative_to(
@@ -698,7 +713,7 @@ pub async fn discover_once(
     timeout: Duration,
     bind_device: Option<&BindDevice>,
 ) -> anyhow::Result<()> {
-    let message = make_ssdp_search_request(kind);
+    let message = make_ssdp_search_request(kind, search_mx(timeout));
     let bind_opts = librqbit_dualstack_sockets::BindOpts {
         device: bind_device,
         ..Default::default()
@@ -1084,7 +1099,7 @@ mod tests {
         )
         .unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let msg = super::make_ssdp_search_request(super::SSDP_SEARCH_GATEWAY_ST);
+        let msg = super::make_ssdp_search_request(super::SSDP_SEARCH_GATEWAY_ST, 1);
         super::send_probes_and_collect(
             vec![(client, vec![super::SSDP_MULTICAST_IP, router_addr])],
             msg.as_bytes(),
@@ -1102,6 +1117,27 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "duplicate location must be deduplicated"
+        );
+    }
+
+    #[test]
+    fn a_search_asks_gateways_to_answer_inside_its_window() {
+        use std::time::Duration;
+        assert_eq!(super::search_mx(Duration::from_millis(1500)), 1);
+        assert_eq!(
+            super::search_mx(Duration::from_millis(300)),
+            1,
+            "UPnP's floor"
+        );
+        assert_eq!(super::search_mx(Duration::from_secs(4)), 3);
+        assert_eq!(
+            super::search_mx(Duration::from_secs(10)),
+            3,
+            "never above 3"
+        );
+        assert!(
+            super::make_ssdp_search_request(super::SSDP_SEARCH_GATEWAY_ST, 1)
+                .contains("\r\nMX: 1\r\n")
         );
     }
 
