@@ -36,6 +36,30 @@ jobs:
       - name: clippy check
         run: cargo clippy --all-targets
 
+  check-each-crate:
+    # A workspace build merges the features every crate asks for, so a crate
+    # that uses a feature without declaring it still compiles there and
+    # fails as soon as it is built alone (`cargo test -p librqbit-upnp`).
+    # The desktop app is left out: it needs the Tauri system libraries.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-each-crate
+
+      - name: cargo check each crate alone, with its tests and examples
+        run: |
+          for package in $(cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[].name | select(. != "rqbit-desktop")'); do
+            echo "::group::$package"
+            cargo check --package "$package" --all-targets
+            echo "::endgroup::"
+          done
+
   test:
     strategy:
       matrix:

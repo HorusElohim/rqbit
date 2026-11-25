@@ -29,4 +29,5 @@ socket2.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tracing-subscriber.workspace = true
+# The examples call `tracing_subscriber::fmt::init()`.
+tracing-subscriber = { workspace = true, features = ["fmt"] }

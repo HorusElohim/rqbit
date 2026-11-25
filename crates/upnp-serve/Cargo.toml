@@ -34,7 +34,8 @@ librqbit-dualstack-sockets.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
-tracing-subscriber.workspace = true
+# The examples call `tracing_subscriber::fmt::init()`.
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 tower-http = { workspace = true, features = ["trace"] }
 
 [[example]]
